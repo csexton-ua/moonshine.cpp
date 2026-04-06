@@ -1,0 +1,464 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Moonshine Transcription</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: system-ui, -apple-system, sans-serif; max-width: 600px; margin: 40px auto; padding: 0 20px; color: #222; }
+  h1 { font-size: 1.4em; margin-bottom: 4px; }
+  .subtitle { color: #666; font-size: 0.9em; margin-bottom: 24px; }
+  .section { margin-bottom: 24px; }
+  .section h2 { font-size: 1em; margin-bottom: 8px; color: #444; }
+  button { padding: 10px 20px; font-size: 1em; border: none; border-radius: 6px; cursor: pointer; }
+  #liveBtn { background: #2563eb; color: white; }
+  #liveBtn.recording { background: #dc2626; }
+  input[type="file"] { margin-bottom: 8px; }
+  #uploadBtn { background: #16a34a; color: white; font-size: 0.9em; padding: 8px 16px; }
+  #uploadBtn:disabled { background: #94a3b8; cursor: not-allowed; }
+  #transcript { margin-top: 16px; padding: 16px; background: #f8fafc; border: 1px solid #e2e8f0;
+    border-radius: 8px; min-height: 60px; font-size: 1.1em; line-height: 1.6; white-space: pre-wrap;
+    display: none; }
+  #transcript.visible { display: block; }
+  .pending { color: #94a3b8; }
+  .status { margin-top: 8px; font-size: 0.85em; color: #666; font-style: italic; }
+  .error { color: #dc2626; }
+  .result { margin-top: 16px; padding: 16px; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; display: none; }
+  .result.visible { display: block; }
+  .result .text { font-size: 1.1em; line-height: 1.5; margin-bottom: 8px; }
+  .result .meta { font-size: 0.8em; color: #666; }
+  .arch-badge { font-size: 0.75em; padding: 1px 5px; border-radius: 3px; margin-left: 4px; vertical-align: middle; }
+  .arch-v1 { background: #e2e8f0; color: #475569; }
+  .arch-v2 { background: #dbeafe; color: #1d4ed8; }
+</style>
+</head>
+<body>
+
+<h1>Moonshine Transcription</h1>
+<p class="subtitle">moonshine.cpp web demo</p>
+
+<div class="section">
+  <h2>Model</h2>
+  <select id="modelSelect" style="padding: 6px 10px; font-size: 0.95em; border-radius: 4px; border: 1px solid #ccc;">
+    <option value="">Loading...</option>
+  </select>
+</div>
+
+<div class="section">
+  <h2>Live microphone</h2>
+  <button id="liveBtn">Start listening</button>
+  <div id="liveStatus" class="status"></div>
+</div>
+
+<div id="transcript"></div>
+
+<hr style="margin: 24px 0; border: none; border-top: 1px solid #e2e8f0;">
+
+<div class="section">
+  <h2>Or upload a file</h2>
+  <input type="file" id="fileInput" accept="audio/*">
+  <button id="uploadBtn">Transcribe</button>
+</div>
+
+<div id="result" class="result">
+  <div class="text" id="resultText"></div>
+  <div class="meta" id="resultMeta"></div>
+</div>
+
+<div id="globalStatus" class="status"></div>
+
+<script>
+const CHUNK_SEC = 3;
+
+const modelSelect = document.getElementById('modelSelect');
+const liveBtn = document.getElementById('liveBtn');
+const liveStatus = document.getElementById('liveStatus');
+const transcriptEl = document.getElementById('transcript');
+const fileInput = document.getElementById('fileInput');
+const uploadBtn = document.getElementById('uploadBtn');
+const result = document.getElementById('result');
+const resultText = document.getElementById('resultText');
+const resultMeta = document.getElementById('resultMeta');
+const globalStatus = document.getElementById('globalStatus');
+
+let modelArchMap = {};  // model name -> arch (v1/v2)
+let wsAvailable = false;
+
+// ── Load models ──
+
+fetch('/models').then(r => r.json()).then(data => {
+  modelSelect.innerHTML = '';
+  wsAvailable = !!data.ws_available;
+  for (const [name, info] of Object.entries(data.models)) {
+    const opt = document.createElement('option');
+    opt.value = name;
+    const archLabel = info.arch === 'v2' ? ' [streaming]' : '';
+    opt.textContent = `${name} (${info.size_mb} MB)${archLabel}`;
+    if (name === data.default) opt.selected = true;
+    modelSelect.appendChild(opt);
+    modelArchMap[name] = info.arch;
+  }
+});
+
+function selectedModelArch() {
+  return modelArchMap[modelSelect.value] || 'unknown';
+}
+
+function canUseWebSocket() {
+  return wsAvailable && selectedModelArch() === 'v2' && typeof AudioContext !== 'undefined';
+}
+
+// ── Live microphone ──
+
+let isListening = false;
+let micStream = null;
+let currentRecorder = null;
+let chunkIndex = 0;
+
+// WebSocket streaming state
+let ws = null;
+let audioCtx = null;
+let workletNode = null;
+
+liveBtn.addEventListener('click', async () => {
+  if (isListening) {
+    stopListening();
+  } else {
+    await startListening();
+  }
+});
+
+async function startListening() {
+  try {
+    micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch (err) {
+    liveStatus.innerHTML = `<span class="error">Mic access denied: ${err.message}</span>`;
+    return;
+  }
+
+  isListening = true;
+  transcriptEl.textContent = '';
+  transcriptEl.classList.add('visible');
+  liveBtn.textContent = 'Stop listening';
+  liveBtn.classList.add('recording');
+
+  if (canUseWebSocket()) {
+    await startWebSocketStreaming();
+  } else {
+    chunkIndex = 0;
+    liveStatus.textContent = 'Listening (chunked)...';
+    captureChunk();
+  }
+}
+
+function stopListening() {
+  isListening = false;
+
+  if (ws) {
+    stopWebSocketStreaming();
+  } else {
+    if (currentRecorder && currentRecorder.state === 'recording') {
+      currentRecorder.stop();
+    }
+  }
+
+  if (micStream) {
+    micStream.getTracks().forEach(t => t.stop());
+    micStream = null;
+  }
+
+  liveBtn.textContent = 'Start listening';
+  liveBtn.classList.remove('recording');
+  liveStatus.textContent = '';
+}
+
+// ── WebSocket streaming (v2 models) ──
+
+async function startWebSocketStreaming() {
+  liveStatus.textContent = 'Connecting...';
+
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const url = `${proto}//${location.host}/ws?model=${encodeURIComponent(modelSelect.value)}`;
+  ws = new WebSocket(url);
+  ws.binaryType = 'arraybuffer';
+
+  ws.onopen = () => {
+    liveStatus.textContent = 'Loading model...';
+  };
+
+  ws.onmessage = (e) => {
+    try {
+      const msg = JSON.parse(e.data);
+      if (msg.status === 'ready') {
+        liveStatus.textContent = 'Listening (streaming)...';
+        startAudioWorklet();
+      } else if (msg.text !== undefined) {
+        if (msg.text) {
+          transcriptEl.textContent = msg.text;
+        }
+      } else if (msg.error) {
+        liveStatus.innerHTML = `<span class="error">${msg.error}</span>`;
+      }
+    } catch (err) { /* ignore */ }
+  };
+
+  ws.onerror = () => {
+    liveStatus.innerHTML = '<span class="error">WebSocket error</span>';
+    stopListening();
+  };
+
+  ws.onclose = () => {
+    if (isListening) {
+      liveStatus.textContent = 'Connection closed';
+      stopListening();
+    }
+  };
+}
+
+function stopWebSocketStreaming() {
+  if (workletNode) {
+    workletNode.disconnect();
+    workletNode = null;
+  }
+  if (audioCtx) {
+    audioCtx.close();
+    audioCtx = null;
+  }
+  if (ws) {
+    // Send finalize before closing
+    try { ws.send(JSON.stringify({action: 'finalize'})); } catch (e) {}
+    try { ws.close(); } catch (e) {}
+    ws = null;
+  }
+}
+
+async function startAudioWorklet() {
+  const TARGET_RATE = 16000;
+
+  audioCtx = new AudioContext();
+  const nativeRate = audioCtx.sampleRate;
+
+  // Register the worklet processor from a Blob URL
+  const processorCode = `
+    class PCMProcessor extends AudioWorkletProcessor {
+      constructor() {
+        super();
+        this.targetRate = 16000;
+        this.chunkSize = Math.ceil(this.targetRate * 0.2); // ~200ms
+        this.buffer = new Float32Array(this.chunkSize);
+        this.writePos = 0;
+      }
+
+      process(inputs) {
+        const input = inputs[0];
+        if (!input || !input[0] || input[0].length === 0) return true;
+        const samples = input[0];
+        const ratio = sampleRate / this.targetRate;
+        const outLen = Math.floor(samples.length / ratio);
+        if (outLen === 0) return true;
+
+        for (let i = 0; i < outLen; i++) {
+          const srcIdx = i * ratio;
+          const idx = Math.floor(srcIdx);
+          const frac = srcIdx - idx;
+          this.buffer[this.writePos++] = (samples[idx] || 0) * (1 - frac)
+                                       + (samples[idx + 1] || 0) * frac;
+
+          if (this.writePos >= this.chunkSize) {
+            this.port.postMessage(this.buffer.buffer, [this.buffer.buffer]);
+            this.buffer = new Float32Array(this.chunkSize);
+            this.writePos = 0;
+          }
+        }
+
+        return true;
+      }
+    }
+    registerProcessor('pcm-processor', PCMProcessor);
+  `;
+
+  const blob = new Blob([processorCode], {type: 'application/javascript'});
+  const url = URL.createObjectURL(blob);
+
+  try {
+    await audioCtx.audioWorklet.addModule(url);
+  } catch (err) {
+    liveStatus.innerHTML = `<span class="error">AudioWorklet not supported: ${err.message}</span>`;
+    URL.revokeObjectURL(url);
+    stopListening();
+    return;
+  }
+  URL.revokeObjectURL(url);
+
+  const source = audioCtx.createMediaStreamSource(micStream);
+  workletNode = new AudioWorkletNode(audioCtx, 'pcm-processor');
+
+  workletNode.port.onmessage = (e) => {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      // e.data is an ArrayBuffer of float32 samples at 16kHz
+      ws.send(e.data);
+    }
+  };
+
+  source.connect(workletNode);
+  workletNode.connect(audioCtx.destination);  // required for processing to run
+}
+
+// ── Chunked mic recording fallback (v1 models) ──
+
+function captureChunk() {
+  if (!isListening || !micStream || ws) return;
+
+  const recorder = new MediaRecorder(micStream);
+  currentRecorder = recorder;
+  const chunks = [];
+  const myIndex = chunkIndex++;
+
+  recorder.ondataavailable = (e) => {
+    if (e.data.size > 0) chunks.push(e.data);
+  };
+
+  recorder.onstop = () => {
+    if (chunks.length === 0) return;
+    const blob = new Blob(chunks, { type: recorder.mimeType });
+    sendChunk(blob, myIndex);
+    // Start next chunk immediately (overlaps with network/transcription time)
+    if (isListening) captureChunk();
+  };
+
+  recorder.start();
+  setTimeout(() => {
+    if (recorder.state === 'recording') recorder.stop();
+  }, CHUNK_SEC * 1000);
+}
+
+async function sendChunk(blob, index) {
+  // Add a pending marker
+  const spanId = `chunk-${index}`;
+  const span = document.createElement('span');
+  span.id = spanId;
+  span.className = 'pending';
+  span.textContent = '...';
+  transcriptEl.appendChild(span);
+
+  try {
+    const form = new FormData();
+    form.append('audio', blob);
+    form.append('model', modelSelect.value);
+    const res = await fetch('/transcribe', { method: 'POST', body: form });
+    const data = await res.json();
+
+    const el = document.getElementById(spanId);
+    if (!el) return;
+
+    if (data.error) {
+      el.innerHTML = `<span class="error">[error]</span> `;
+    } else {
+      const text = (data.text || '').trim();
+      if (text) {
+        el.className = '';
+        el.textContent = text + ' ';
+      } else {
+        el.textContent = '';
+      }
+    }
+  } catch (err) {
+    const el = document.getElementById(spanId);
+    if (el) el.innerHTML = `<span class="error">[failed]</span> `;
+  }
+}
+
+// ── File upload ──
+
+uploadBtn.addEventListener('click', async () => {
+  const file = fileInput.files[0];
+  if (!file) return;
+
+  const arch = selectedModelArch();
+  globalStatus.textContent = 'Transcribing...';
+  result.classList.remove('visible');
+  uploadBtn.disabled = true;
+
+  try {
+    if (arch === 'v2') {
+      // Use streaming endpoint for v2 models — show text as it arrives
+      await streamTranscribe(file);
+    } else {
+      // Batch endpoint for v1 models
+      await batchTranscribe(file);
+    }
+  } catch (err) {
+    globalStatus.innerHTML = `<span class="error">Request failed: ${err.message}</span>`;
+  } finally {
+    uploadBtn.disabled = false;
+  }
+});
+
+async function batchTranscribe(file) {
+  const form = new FormData();
+  form.append('audio', file);
+  form.append('model', modelSelect.value);
+  const res = await fetch('/transcribe', { method: 'POST', body: form });
+  const data = await res.json();
+
+  if (data.error) {
+    globalStatus.innerHTML = `<span class="error">${data.error}</span>`;
+  } else {
+    resultText.textContent = data.text || '(empty)';
+    resultMeta.textContent = `${data.time_ms} ms`;
+    result.classList.add('visible');
+    globalStatus.textContent = '';
+  }
+}
+
+async function streamTranscribe(file) {
+  const form = new FormData();
+  form.append('audio', file);
+  form.append('model', modelSelect.value);
+
+  resultText.textContent = '';
+  resultMeta.textContent = 'streaming...';
+  result.classList.add('visible');
+  globalStatus.textContent = '';
+
+  const res = await fetch('/stream', { method: 'POST', body: form });
+
+  if (!res.ok) {
+    const data = await res.json();
+    globalStatus.innerHTML = `<span class="error">${data.error || 'Stream failed'}</span>`;
+    result.classList.remove('visible');
+    return;
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let fullText = '';
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    const chunk = decoder.decode(value, { stream: true });
+    // Parse SSE events
+    for (const line of chunk.split('\n')) {
+      if (!line.startsWith('data: ')) continue;
+      const payload = line.slice(6);
+      if (payload === '[DONE]') {
+        resultMeta.textContent = 'done';
+        continue;
+      }
+      try {
+        const msg = JSON.parse(payload);
+        if (msg.error) {
+          globalStatus.innerHTML = `<span class="error">${msg.error}</span>`;
+        } else if (msg.text) {
+          fullText += msg.text;
+          resultText.textContent = fullText;
+        }
+      } catch (e) { /* ignore parse errors */ }
+    }
+  }
+}
+</script>
+</body>
+</html>

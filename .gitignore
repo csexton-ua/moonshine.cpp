@@ -1,0 +1,14 @@
+build/
+.cache/
+.venv/
+Testing/
+__pycache__/
+*.o
+*.a
+*.so
+*.dylib
+.DS_Store
+
+# Models — download or convert locally
+models/*.gguf
+models/tokenizer.bin
