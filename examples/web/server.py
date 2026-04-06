@@ -153,6 +153,9 @@ MSG_AUDIO    = 1
 MSG_FINALIZE = 2
 MSG_RESET    = 3
 
+# Response flags (must match RESP_* in moonshine-stream-server)
+RESP_FLAG_SEGMENT_FINAL = 0x01
+
 MAX_RESPONSE_LEN = 1_000_000
 
 
@@ -244,19 +247,35 @@ def ws_send_close(sock, code=1000):
 
 
 def _read_subprocess_response(stdout):
-    """Read a length-prefixed UTF-8 response from the stream server. Returns text or None on error."""
+    """Read a length-prefixed response from the stream server.
+
+    Protocol: [uint32 payload_len] [uint8 flags] [UTF-8 text]
+    flags & 0x01 = segment_final (auto-reset boundary)
+
+    Returns (text, segment_final) or (None, False) on error.
+    """
     len_data = stdout.read(4)
     if len(len_data) < 4:
-        return None
-    resp_len = struct.unpack("<I", len_data)[0]
-    if resp_len > MAX_RESPONSE_LEN:
-        return None
-    if resp_len == 0:
-        return ""
-    text_data = stdout.read(resp_len)
-    if len(text_data) < resp_len:
-        return None
-    return text_data.decode("utf-8", errors="replace")
+        return None, False
+    payload_len = struct.unpack("<I", len_data)[0]
+    if payload_len > MAX_RESPONSE_LEN:
+        return None, False
+    if payload_len == 0:
+        return "", False
+    # Read flags byte
+    flags_data = stdout.read(1)
+    if len(flags_data) < 1:
+        return None, False
+    flags = flags_data[0]
+    segment_final = bool(flags & RESP_FLAG_SEGMENT_FINAL)
+    # Read text
+    text_len = payload_len - 1
+    if text_len == 0:
+        return "", segment_final
+    text_data = stdout.read(text_len)
+    if len(text_data) < text_len:
+        return None, False
+    return text_data.decode("utf-8", errors="replace"), segment_final
 
 
 # ── HTTP Handler ─────────────────────────────────────────────────────────────
@@ -513,10 +532,13 @@ class Handler(BaseHTTPRequestHandler):
                         ws_send_text(sock, json.dumps({"error": "Stream server crashed"}))
                         break
 
-                    text = _read_subprocess_response(proc.stdout)
+                    text, segment_final = _read_subprocess_response(proc.stdout)
                     if text is None:
                         break
-                    ws_send_text(sock, json.dumps({"text": text}))
+                    msg_out = {"text": text}
+                    if segment_final:
+                        msg_out["segment_final"] = True
+                    ws_send_text(sock, json.dumps(msg_out))
 
                 elif opcode == WS_OP_TEXT:
                     try:
@@ -525,7 +547,7 @@ class Handler(BaseHTTPRequestHandler):
                             header = struct.pack("<II", MSG_FINALIZE, 0)
                             proc.stdin.write(header)
                             proc.stdin.flush()
-                            text = _read_subprocess_response(proc.stdout)
+                            text, _ = _read_subprocess_response(proc.stdout)
                             if text is not None:
                                 ws_send_text(sock, json.dumps({"text": text, "final": True}))
 
@@ -533,7 +555,7 @@ class Handler(BaseHTTPRequestHandler):
                             header = struct.pack("<II", MSG_RESET, 0)
                             proc.stdin.write(header)
                             proc.stdin.flush()
-                            _read_subprocess_response(proc.stdout)
+                            _read_subprocess_response(proc.stdout)  # discard ack
 
                     except (json.JSONDecodeError, UnicodeDecodeError, BrokenPipeError):
                         pass

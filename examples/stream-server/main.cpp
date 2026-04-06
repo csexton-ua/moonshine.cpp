@@ -11,11 +11,13 @@
  *     msg_type 3 = RESET    (payload: empty)
  *
  * Protocol (stdout, little-endian):
- *   [uint32 payload_bytes] [UTF-8 text]
+ *   [uint32 payload_bytes] [uint8 flags] [UTF-8 text]
+ *     flags & 0x01 = segment_final (silence/time-limit auto-reset boundary)
  */
 
 #include "moonshine-streaming.h"
 
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -38,15 +40,28 @@ static bool read_exact(FILE * f, void * buf, size_t n) {
     return got == n;
 }
 
+static float compute_rms(const float * samples, int n) {
+    if (n <= 0) return 0.0f;
+    double sum = 0.0;
+    for (int i = 0; i < n; i++) {
+        sum += (double)samples[i] * samples[i];
+    }
+    return (float)sqrt(sum / n);
+}
+
 static bool write_exact(FILE * f, const void * buf, size_t n) {
     size_t wrote = fwrite(buf, 1, n, f);
     return wrote == n;
 }
 
-static bool send_response(const char * text) {
-    uint32_t len = text ? (uint32_t)strlen(text) : 0;
-    if (!write_exact(stdout, &len, 4)) return false;
-    if (len > 0 && !write_exact(stdout, text, len)) return false;
+static const uint8_t RESP_SEGMENT_FINAL = 1;
+
+static bool send_response(const char * text, uint8_t flags = 0) {
+    uint32_t text_len = text ? (uint32_t)strlen(text) : 0;
+    uint32_t payload_len = 1 + text_len;
+    if (!write_exact(stdout, &payload_len, 4)) return false;
+    if (!write_exact(stdout, &flags, 1)) return false;
+    if (text_len > 0 && !write_exact(stdout, text, text_len)) return false;
     fflush(stdout);
     return true;
 }
@@ -85,6 +100,15 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    const int hard_reset_threshold = 750;        // ~15 seconds at 50 fps
+    const int min_segment_frames = 100;          // ~2 seconds minimum before silence reset
+    const float silence_rms_threshold = 0.008f;
+    const int silence_chunks_required = 2;       // ~400ms of silence
+    int silence_chunk_count = 0;
+    fprintf(stderr, "[stream-server] segmentation: hard limit %d frames (~%ds), max %d\n",
+            hard_reset_threshold, hard_reset_threshold / 50,
+            moonshine_stream_get_max_position(ctx));
+
     // Signal ready
     fprintf(stdout, "READY\n");
     fflush(stdout);
@@ -114,11 +138,35 @@ int main(int argc, char ** argv) {
                 break;
             }
 
-            // Process audio -> encode -> decode
             int new_features = moonshine_stream_process_audio(ctx, state, audio.data(), n_samples);
             if (new_features < 0) {
                 fprintf(stderr, "[stream-server] process_audio failed\n");
                 send_response("");
+                continue;
+            }
+
+            // Check segmentation before encoding: silence or hard time limit
+            const int pos = moonshine_stream_get_position(state);
+            const float rms = compute_rms(audio.data(), n_samples);
+
+            if (rms < silence_rms_threshold) {
+                silence_chunk_count++;
+            } else {
+                silence_chunk_count = 0;
+            }
+
+            const bool at_hard_limit = (pos >= hard_reset_threshold);
+            const bool at_silence = (pos >= min_segment_frames &&
+                                     silence_chunk_count >= silence_chunks_required);
+
+            if (at_hard_limit || at_silence) {
+                fprintf(stderr, "[stream-server] %s reset at position %d\n",
+                        at_hard_limit ? "hard" : "silence", pos);
+                moonshine_stream_encode(ctx, state, true);
+                const char * final_text = moonshine_stream_decode(ctx, state);
+                if (!send_response(final_text ? final_text : "", RESP_SEGMENT_FINAL)) break;
+                moonshine_stream_reset(state);
+                silence_chunk_count = 0;
                 continue;
             }
 

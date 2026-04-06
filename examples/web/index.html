@@ -120,6 +120,7 @@ let chunkIndex = 0;
 let ws = null;
 let audioCtx = null;
 let workletNode = null;
+let finalizedText = '';
 
 liveBtn.addEventListener('click', async () => {
   if (isListening) {
@@ -138,6 +139,7 @@ async function startListening() {
   }
 
   isListening = true;
+  finalizedText = '';
   transcriptEl.textContent = '';
   transcriptEl.classList.add('visible');
   liveBtn.textContent = 'Stop listening';
@@ -194,8 +196,11 @@ async function startWebSocketStreaming() {
         liveStatus.textContent = 'Listening (streaming)...';
         startAudioWorklet();
       } else if (msg.text !== undefined) {
-        if (msg.text) {
-          transcriptEl.textContent = msg.text;
+        if (msg.segment_final) {
+          if (msg.text) finalizedText += msg.text.trim() + ' ';
+          transcriptEl.textContent = finalizedText.trim();
+        } else if (msg.text) {
+          transcriptEl.textContent = (finalizedText + msg.text).trim();
         }
       } else if (msg.error) {
         liveStatus.innerHTML = `<span class="error">${msg.error}</span>`;

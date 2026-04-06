@@ -83,6 +83,14 @@ const char * moonshine_stream_decode(
 // Reset state for new utterance (reuse same allocation)
 void moonshine_stream_reset(struct moonshine_stream_state * state);
 
+// Query current adapter position offset (frames processed since last reset).
+// Compare against moonshine_stream_get_max_position() to know when to reset.
+int moonshine_stream_get_position(const struct moonshine_stream_state * state);
+
+// Query the model's max_position_embeddings limit.
+// Streaming quality degrades when position exceeds this value.
+int moonshine_stream_get_max_position(const struct moonshine_streaming_context * ctx);
+
 #ifdef __cplusplus
 }
 #endif

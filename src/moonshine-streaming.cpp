@@ -1203,8 +1203,19 @@ static int moonshine_streaming_run_adapter(
 
     // Fill position indices (with offset for incremental streaming)
     {
+        const int max_pos = (int)hp.max_position_embeddings;
         std::vector<int32_t> ids(seq_len);
-        for (int i = 0; i < seq_len; i++) ids[i] = i + pos_offset;
+        for (int i = 0; i < seq_len; i++) {
+            ids[i] = std::min(i + pos_offset, max_pos - 1);
+        }
+        if (pos_offset + seq_len > max_pos) {
+            static bool warned = false;
+            if (!warned) {
+                fprintf(stderr, "%s: WARNING: positions clamped at %d (max %d), call reset\n",
+                        __func__, pos_offset + seq_len, max_pos);
+                warned = true;
+            }
+        }
         ggml_backend_tensor_set(pos_ids, ids.data(), 0, seq_len * sizeof(int32_t));
     }
 
@@ -1517,6 +1528,45 @@ static int streaming_decode_step(struct moonshine_streaming_context * ctx, int32
     return 0;
 }
 
+static constexpr float REPETITION_PENALTY = 1.2f;
+static constexpr int   REPETITION_WINDOW  = 30;
+
+// Greedy decode loop with repetition penalty. Returns generated token ids.
+static std::vector<int32_t> greedy_decode(
+        struct moonshine_streaming_context * ctx,
+        int max_len, ggml_gallocr_t gallocr) {
+    const auto & hp = ctx->model.hparams;
+    const int vs = (int)hp.vocab_size;
+
+    std::vector<int32_t> tokens;
+    int32_t token = (int32_t)hp.bos_token_id;
+    std::vector<float> logits(vs);
+
+    for (int step = 0; step < max_len; step++) {
+        if (streaming_decode_step(ctx, token, logits, gallocr) != 0) break;
+
+        const int start = std::max(0, (int)tokens.size() - REPETITION_WINDOW);
+        for (int j = start; j < (int)tokens.size(); j++) {
+            const int32_t tid = tokens[j];
+            if (tid >= 0 && tid < vs) {
+                if (logits[tid] > 0.0f) logits[tid] /= REPETITION_PENALTY;
+                else                     logits[tid] *= REPETITION_PENALTY;
+            }
+        }
+
+        int32_t best = 0;
+        float best_val = logits[0];
+        for (int i = 1; i < vs; i++) {
+            if (logits[i] > best_val) { best_val = logits[i]; best = i; }
+        }
+
+        if (best == (int32_t)hp.eos_token_id) break;
+        tokens.push_back(best);
+        token = best;
+    }
+    return tokens;
+}
+
 // ── Transcribe ───────────────────────────────────────────────────────────────
 
 const char * moonshine_streaming_transcribe(struct moonshine_streaming_context * ctx,
@@ -1610,32 +1660,8 @@ const char * moonshine_streaming_transcribe(struct moonshine_streaming_context *
         ggml_free(plan_ctx);
     }
 
-    // 7. Greedy decode loop
-    std::vector<int32_t> tokens;
-    int32_t token = (int32_t)hp.bos_token_id;
-    std::vector<float> logits(hp.vocab_size);
-
-    for (int step = 0; step < max_len; step++) {
-        ret = streaming_decode_step(ctx, token, logits, gallocr);
-        if (ret != 0) {
-            break;
-        }
-
-        // Argmax
-        int32_t best = 0;
-        float best_val = logits[0];
-        for (int i = 1; i < (int)hp.vocab_size; i++) {
-            if (logits[i] > best_val) {
-                best_val = logits[i];
-                best = i;
-            }
-        }
-
-        if (best == (int32_t)hp.eos_token_id) break;
-
-        tokens.push_back(best);
-        token = best;
-    }
+    // 7. Greedy decode
+    std::vector<int32_t> tokens = greedy_decode(ctx, max_len, gallocr);
 
     auto t_decode_done = std::chrono::high_resolution_clock::now();
 
@@ -1910,29 +1936,7 @@ const char * moonshine_stream_decode(
         ggml_free(plan_ctx);
     }
 
-    // Greedy decode from BOS
-    std::vector<int32_t> tokens;
-    int32_t token = (int32_t)hp.bos_token_id;
-    std::vector<float> logits(hp.vocab_size);
-
-    for (int step = 0; step < max_len; step++) {
-        ret = streaming_decode_step(ctx, token, logits, gallocr);
-        if (ret != 0) break;
-
-        int32_t best = 0;
-        float best_val = logits[0];
-        for (int i = 1; i < (int)hp.vocab_size; i++) {
-            if (logits[i] > best_val) {
-                best_val = logits[i];
-                best = i;
-            }
-        }
-
-        if (best == (int32_t)hp.eos_token_id) break;
-
-        tokens.push_back(best);
-        token = best;
-    }
+    std::vector<int32_t> tokens = greedy_decode(ctx, max_len, gallocr);
 
     state->result_text = ctx->tokenizer.tokens_to_text(tokens);
 
@@ -1941,4 +1945,12 @@ const char * moonshine_stream_decode(
     ctx->kv_cross.reset();
 
     return state->result_text.c_str();
+}
+
+int moonshine_stream_get_position(const struct moonshine_stream_state * state) {
+    return state ? state->adapter_pos_offset : 0;
+}
+
+int moonshine_stream_get_max_position(const struct moonshine_streaming_context * ctx) {
+    return ctx ? (int)ctx->model.hparams.max_position_embeddings : 0;
 }
